@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# atol — session-less Claude CLI wrapper
+# https://github.com/MrAta/atol
+
+set -euo pipefail
+
+VERSION="0.1.0"
+MODEL="claude-opus-4-6"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/atol/config"
+LOG_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/atol/log.md"
+
+ALLOWED_TOOLS='Read,Glob,Grep,Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(git:*),Bash(kubectl:*),Bash(jq:*)'
+LOGS_TOOLS='Bash(kubectl:*),Bash(jq:*)'
+
+spinner_pid=""
+
+# ---------------------------------------------------------------------------
+# Spinner
+# ---------------------------------------------------------------------------
+
+spinner_start() {
+  [[ -t 2 ]] || return 0
+  local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  (
+    i=0
+    while true; do
+      printf '\r  %s  thinking...' "${chars:$((i % ${#chars})):1}" >&2
+      sleep 0.1
+      ((i++)) || true
+    done
+  ) &
+  spinner_pid=$!
+  trap 'spinner_stop; exit 130' INT TERM
+}
+
+spinner_stop() {
+  [[ -n "${spinner_pid:-}" ]] || return 0
+  kill "$spinner_pid" 2>/dev/null || true
+  wait "$spinner_pid" 2>/dev/null || true
+  printf '\r\033[K' >&2
+  spinner_pid=""
+}
+
+# ---------------------------------------------------------------------------
+# Output renderer
+# ---------------------------------------------------------------------------
+
+render_output() {
+  local text="$1"
+  if [[ ! -t 1 ]]; then
+    printf '%s\n' "$text"
+    return
+  fi
+  if command -v glow &>/dev/null; then
+    printf '%s\n' "$text" | PAGER='less -rFX' glow -p
+  elif command -v bat &>/dev/null; then
+    printf '%s\n' "$text" | bat --language=markdown --paging=auto
+  else
+    printf '%s\n' "$text" | less -rFX
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Log
+# ---------------------------------------------------------------------------
+
+log_entry() {
+  local prompt="$1" output="$2"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  local ts; ts=$(date '+%Y-%m-%d %H:%M')
+  local short_prompt; short_prompt="${prompt:0:60}"
+  printf '## %s — %s\n\n**Q:** %s\n\n**A:** %s\n\n---\n\n' \
+    "$ts" "$short_prompt" "$prompt" "$output" >> "$LOG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Auto-context
+# ---------------------------------------------------------------------------
+
+build_context() {
+  local ctx=""
+
+  if git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+    local branch; branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    local last; last=$(git log -1 --format="%s" 2>/dev/null)
+    ctx+="[git: branch=$branch, last commit: \"$last\"]"$'\n'
+  fi
+
+  for marker in package.json pyproject.toml requirements.txt go.mod Cargo.toml Makefile; do
+    [[ -f "$marker" ]] || continue
+    case "$marker" in
+      package.json)                    ctx+="[project: Node.js]"$'\n' ;;
+      pyproject.toml|requirements.txt) ctx+="[project: Python]"$'\n' ;;
+      go.mod)                          ctx+="[project: Go]"$'\n' ;;
+      Cargo.toml)                      ctx+="[project: Rust]"$'\n' ;;
+      Makefile)                        ctx+="[project: Makefile-based]"$'\n' ;;
+    esac
+    break
+  done
+
+  [[ -n "$ctx" ]] && printf '%s\n' "$ctx"
+}
+
+# ---------------------------------------------------------------------------
+# Core run functions
+# ---------------------------------------------------------------------------
+
+run_claude_with_tools() {
+  local prompt="$1"
+  local tools="${2:-}"
+
+  local cmd=(claude --print --output-format=text --model "$MODEL")
+
+  # continue flag
+  if [[ "${continue_flag:-0}" -eq 1 ]]; then
+    cmd+=(--continue)
+  fi
+
+  # add-dir entries
+  if [[ ${#add_dirs[@]+"${#add_dirs[@]}"} -gt 0 ]]; then
+    for d in "${add_dirs[@]}"; do
+      cmd+=(--add-dir "$d")
+    done
+  fi
+
+  [[ -n "$tools" ]] && cmd+=(--allowedTools "$tools")
+  cmd+=(-- "$prompt")
+
+  spinner_start
+  local atol_err; atol_err=$(mktemp /tmp/atol_err_XXXXXX)
+  local output
+  if ! output=$("${cmd[@]}" 2>"$atol_err"); then
+    spinner_stop
+    cat "$atol_err" >&2
+    rm -f "$atol_err"
+    exit 1
+  fi
+  spinner_stop
+  rm -f "$atol_err"
+
+  if [[ -n "${output_file:-}" ]]; then
+    printf '%s\n' "$output" > "$output_file"
+    printf 'atol: saved to %s\n' "$output_file" >&2
+  fi
+
+  log_entry "$prompt" "$output"
+
+  if [[ "${draft:-0}" -eq 1 ]]; then
+    local tmp; tmp=$(mktemp /tmp/atol_draft_XXXXXX.md)
+    printf '%s\n' "$output" > "$tmp"
+    "${EDITOR:-vi}" "$tmp"
+    printf 'atol: draft at %s\n' "$tmp" >&2
+  else
+    render_output "$output"
+  fi
+}
+
+run_claude() {
+  local prompt="$1"
+  local tools="$ALLOWED_TOOLS"
+  [[ "${no_tools:-0}" -eq 1 ]] && tools=""
+  run_claude_with_tools "$prompt" "$tools"
+}
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+
+mode_fix() {
+  local cmd_to_run=("$@")
+  [[ ${#cmd_to_run[@]} -eq 0 ]] && { printf 'atol fix: no command given\n' >&2; exit 1; }
+
+  printf 'atol: running: %s\n' "${cmd_to_run[*]}" >&2
+
+  local output exit_code
+  output=$("${cmd_to_run[@]}" 2>&1) && exit_code=0 || exit_code=$?
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    printf 'atol: command succeeded.\n' >&2
+    printf '%s\n' "$output"
+    exit 0
+  fi
+
+  local prompt
+  prompt="$(printf 'The following command failed with exit code %d:\n\n%s\n\nOutput:\n%s\n\nWhat went wrong and how do I fix it?' \
+    "$exit_code" "${cmd_to_run[*]}" "$output")"
+
+  no_tools=1 run_claude_with_tools "$prompt" ""
+}
+
+mode_logs() {
+  local target="${1:-}"
+  [[ -z "$target" ]] && { printf 'usage: atol logs <pod-name>\n' >&2; exit 1; }
+
+  if ! command -v kubectl &>/dev/null; then
+    printf 'atol: kubectl not found in PATH\n' >&2
+    exit 1
+  fi
+
+  local prompt
+  prompt="$(cat <<EOF
+The user wants to check on the Kubernetes pod named "$target".
+
+Use kubectl to investigate it:
+1. Find which namespace it's in (check default first, then --all-namespaces)
+2. Run kubectl describe pod to get status, events, resource usage, exit codes
+3. Run kubectl logs --tail=500 to get recent output
+
+Then tell the user:
+- Is the job running, completed, or failed?
+- If it's a training run: what is the current progress (step, loss, epoch, throughput — whatever is visible in the logs)?
+- If it failed: what is the exact root cause (OOM? crash? image issue? node eviction?)?
+- What should they do next?
+
+Be concise and direct. Lead with the status on the first line.
+EOF
+)"
+
+  run_claude_with_tools "$prompt" "$LOGS_TOOLS"
+}
+
+mode_recall() {
+  local term="${*:-}"
+
+  if [[ ! -f "$LOG_FILE" ]]; then
+    printf 'atol: no history yet.\n' >&2
+    exit 0
+  fi
+
+  if [[ -z "$term" ]]; then
+    render_output "$(cat "$LOG_FILE")"
+  elif command -v fzf &>/dev/null; then
+    local chosen
+    chosen=$(grep '^## ' "$LOG_FILE" | sed 's/^## //' | fzf --prompt="recall> ") || exit 0
+    local escaped; escaped=$(printf '%s' "$chosen" | sed 's/[.[\*^$()+?{|]/\\&/g')
+    awk "/^## ${escaped}/{found=1} found{print} /^## /{if(found && !/^## ${escaped}/)found=0}" "$LOG_FILE" \
+      | render_output "$(cat)"
+  else
+    grep -A 100 "## .*${term}" "$LOG_FILE" | render_output "$(cat /dev/stdin)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<'EOF'
+atol — session-less Claude CLI wrapper
+
+USAGE
+  atol [flags] "question"           ask a question
+  atol fix <cmd...>                 run cmd; if it fails, ask Claude why
+  atol logs <pod-name>              k8s pod status + log analysis
+  atol recall [term]                search past queries
+
+FLAGS (query mode)
+  -c                  continue last session
+  --repo              add git root as context dir
+  -f <file>           inline file into prompt (repeatable)
+  -o <file>           save output to file
+  --no-tools          omit tools (faster, no file access)
+  --draft             open output in $EDITOR
+  -h, --help          show this help
+  -v, --version       show version
+
+EXAMPLES
+  atol "what does CUDA_VISIBLE_DEVICES do"
+  cat training.log | atol "summarize the training progress"
+  atol fix kubectl get pods -n ml-jobs
+  atol logs trainer-7f9xk
+  atol recall "OOM"
+  atol --repo "how is the training loop structured"
+  atol --draft "write a k8s Job spec for PyTorch DDP"
+  atol -o notes.md "explain DDP vs FSDP"
+  false; why
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  # Globals set by flag parsing
+  continue_flag=0
+  add_dirs=()
+  inline_files=()
+  output_file=""
+  no_tools=0
+  draft=0
+
+  # Subcommand dispatch (first arg, no leading dash)
+  case "${1:-}" in
+    fix)
+      shift
+      mode_fix "$@"
+      return
+      ;;
+    logs)
+      shift
+      mode_logs "${1:-}"
+      return
+      ;;
+    recall)
+      shift
+      mode_recall "$@"
+      return
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      printf 'atol %s\n' "$VERSION"
+      exit 0
+      ;;
+  esac
+
+  # Flag parsing for query mode
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--continue)
+        continue_flag=1
+        shift
+        ;;
+      --repo)
+        local repo_root
+        repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+          printf 'atol: --repo: not inside a git repository\n' >&2; exit 1
+        }
+        add_dirs+=("$repo_root")
+        shift
+        ;;
+      -f)
+        [[ $# -lt 2 ]] && { printf 'atol: -f requires a filename\n' >&2; exit 1; }
+        inline_files+=("$2")
+        shift 2
+        ;;
+      -o)
+        [[ $# -lt 2 ]] && { printf 'atol: -o requires a filename\n' >&2; exit 1; }
+        output_file="$2"
+        shift 2
+        ;;
+      --no-tools)
+        no_tools=1
+        shift
+        ;;
+      --draft)
+        draft=1
+        shift
+        ;;
+      -h|--help)
+        usage; exit 0
+        ;;
+      -v|--version)
+        printf 'atol %s\n' "$VERSION"; exit 0
+        ;;
+      --)
+        shift; positional+=("$@"); break
+        ;;
+      -*)
+        printf 'atol: unknown flag: %s\n' "$1" >&2; exit 1
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # Require exactly one positional arg (the question)
+  if [[ ${#positional[@]} -eq 0 ]]; then
+    usage; exit 1
+  fi
+  if [[ ${#positional[@]} -gt 1 ]]; then
+    printf 'atol: too many arguments (did you forget to quote your question?)\n' >&2
+    exit 1
+  fi
+
+  local question="${positional[0]}"
+
+  # Inline files
+  local file_content=""
+  for f in "${inline_files[@]+"${inline_files[@]}"}"; do
+    [[ -f "$f" ]] || { printf 'atol: file not found: %s\n' "$f" >&2; exit 1; }
+    file_content+=$'\n'"--- $f ---"$'\n'"$(cat "$f")"$'\n'
+  done
+
+  # Piped stdin
+  local stdin_content=""
+  if [[ ! -t 0 ]]; then
+    stdin_content=$(cat)
+  fi
+
+  # Auto-context
+  local ctx; ctx=$(build_context)
+
+  # Assemble prompt
+  local prompt=""
+  [[ -n "$ctx" ]]          && prompt+="${ctx}"$'\n'
+  [[ -n "$stdin_content" ]] && prompt+="--- stdin ---"$'\n'"${stdin_content}"$'\n\n'
+  [[ -n "$file_content" ]]  && prompt+="${file_content}"$'\n'
+  prompt+="${question}"
+
+  run_claude "$prompt"
+}
+
+main "$@"
