@@ -61,7 +61,7 @@ render_output() {
 }
 
 # ---------------------------------------------------------------------------
-# Log
+# 
 # ---------------------------------------------------------------------------
 
 log_entry() {
@@ -202,7 +202,7 @@ mode_logs() {
 The user wants to check on the Kubernetes pod named "$target".
 
 Use kubectl to investigate it:
-1. Use the currently set context and namespace. If not found, do not search further; ask the user to check if the right context is set or not.
+1. Use the currently set context and namespace. To get current namespace run kubectl config view --minify | grep namespace. If not found, do not search further; ask the user to check if the right context is set or not.
 2. Run kubectl describe pod to get status, events, resource usage, exit codes
 3. Run kubectl logs --tail=500 to get recent output
 
