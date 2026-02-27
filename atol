@@ -117,7 +117,7 @@ run_claude_with_tools() {
   fi
 
   # add-dir entries
-  if [[ ${#add_dirs[@]+"${#add_dirs[@]}"} -gt 0 ]]; then
+  if [[ ${#add_dirs[@]} -gt 0 ]]; then
     for d in "${add_dirs[@]}"; do
       cmd+=(--add-dir "$d")
     done
@@ -208,7 +208,7 @@ Use kubectl to investigate it:
 
 Then tell the user:
 - Is the job running, completed, or failed?
-- If it's a training run: what is the current progress (step, loss, epoch, throughput — whatever is visible in the logs)?
+- If it is a training run: what is the current progress (step, loss, epoch, throughput — whatever is visible in the logs)?
 - If it failed: what is the exact root cause (OOM? crash? image issue? node eviction?)?
 - What should they do next?
 
